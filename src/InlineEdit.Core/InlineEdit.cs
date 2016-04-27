@@ -1,8 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.Data.Entity;
 using System.Data.Entity.Validation;
-using System.Linq;
 using InlineEdit.Core.Commands;
 using InlineEdit.Core.Events;
 using InlineEdit.Core.Model;
@@ -11,8 +9,7 @@ namespace InlineEdit.Core
 {
     public interface IInlineEdit<T> : IDisposable
     {
-        IEnumerable<IMessage> Handle(UpdateEntityCommand<T> cmd);
-        event EventHandler<EntityUpdatedEventArgs<T>> EntityUpdated;
+        UpdateEntityCommand<T> Handle(UpdateEntityCommand<T> cmd);
         event EventHandler<EntityUpdatedEventArgs<T>> Complete;
         event EventHandler<ExceptionEventArgs<T>> Exception;
         event EventHandler<SetPropertyExceptionEventArgs<T>> SetPropertyException;
@@ -29,19 +26,20 @@ namespace InlineEdit.Core
         where TContext : DbContext
     {
         private readonly TContext db;
-        private const int defaultVersion = -1;
+        private const int DefaultVersion = -1;
 
         public InlineEdit(TContext db)
         {
             this.db = db;
         }
 
-        public void Dispose()
-        {
-            db.Dispose();
-        }
-
-        public IEnumerable<IMessage> Handle(UpdateEntityCommand<T> cmd)
+        /// <summary>
+        /// Handles the command provided to the method, will update the DbSet based on the EntitySet provided in the command.
+        /// New tranaction will be created, where Isolation level that is provided on the command will be used.
+        /// </summary>
+        /// <param name="cmd"></param>
+        /// <returns></returns>
+        public UpdateEntityCommand<T> Handle(UpdateEntityCommand<T> cmd)
         {
             using (var tx = db.Database.BeginTransaction(cmd.IsolationLevel))
             {
@@ -49,7 +47,14 @@ namespace InlineEdit.Core
             }
         }
 
-        public IEnumerable<IMessage> Handle(UpdateEntityCommand<T> cmd, DbContextTransaction tx)
+        /// <summary>
+        /// Handles the command provided to the method, will update the DbSet based on the EntitySet provided in the command.
+        /// This overload allows to supply own transaction reference.
+        /// </summary>
+        /// <param name="cmd"></param>
+        /// <param name="tx"></param>
+        /// <returns></returns>
+        public UpdateEntityCommand<T> Handle(UpdateEntityCommand<T> cmd, DbContextTransaction tx)
         {
             var item = db.Set(cmd.EntityType).Find(cmd.Id);
             if (item == null)
@@ -57,13 +62,13 @@ namespace InlineEdit.Core
                 throw new NullReferenceException("Resource not found");
             }
 
-            var version = defaultVersion;
+            var version = DefaultVersion;
 
             try
             {
                 var original = UpdateEntity(cmd, item);
-                version = UpdateVersion(item);
-                OnBeforeSave(new BeforeSaveEventArgs<T, TContext>
+                version = UpdateVersion(item as IHaveVersion, DefaultVersion);
+                BeforeSave?.Invoke(this, new BeforeSaveEventArgs<T, TContext>
                 {
                     Context = db,
                     Command = cmd,
@@ -73,30 +78,23 @@ namespace InlineEdit.Core
                 db.SaveChanges();
 
                 tx.Commit();
-
-                OnEntityUpdated(new EntityUpdatedEventArgs<T>
-                {
-                    Command = cmd,
-                    Original = new { value = original, version },
-                    Version = version
-                });
-                return new List<IMessage>();
+                return cmd;
             }
             catch (DbEntityValidationException ex)
             {
                 tx.Rollback();
-                OnDbEntityValidationException(new DbEntityValidationExceptionEventArgs<T>(cmd, ex, version));
+                DbEntityValidationException?.Invoke(this, new DbEntityValidationExceptionEventArgs<T>(cmd, ex, version));
                 throw;
             }
             catch (Exception ex)
             {
                 tx.Rollback();
-                OnException(new ExceptionEventArgs<T>(cmd, ex, version));
+                Exception?.Invoke(this, new ExceptionEventArgs<T>(cmd, ex, version));
                 throw;
             }
             finally
             {
-                OnComplete(new EntityUpdatedEventArgs<T>
+                Complete?.Invoke(this, new EntityUpdatedEventArgs<T>
                 {
                     Command = cmd,
                     Version = version
@@ -123,32 +121,13 @@ namespace InlineEdit.Core
             return original;
         }
 
-        private static int UpdateVersion(object item)
-        {
-            var versioned = item as IHaveVersion;
-            if (versioned == null)
-            {
-                throw new Exception("Item is not versionable");
-            }
-
-            var v = versioned.Version;
-            versioned.Version = v + 1;
-            return versioned.Version;
-        }
+        private static int UpdateVersion(IHaveVersion item, int defaultVersion) => item?.Version + 1 ?? defaultVersion;
 
         public event EventHandler<BeforeSaveEventArgs<T, TContext>> BeforeSave;
-        public event EventHandler<EntityUpdatedEventArgs<T>> EntityUpdated;
         public event EventHandler<EntityUpdatedEventArgs<T>> Complete;
         public event EventHandler<DbEntityValidationExceptionEventArgs<T>> DbEntityValidationException;
         public event EventHandler<ExceptionEventArgs<T>> Exception;
         public event EventHandler<SetPropertyExceptionEventArgs<T>> SetPropertyException;
-
-        protected virtual void OnBeforeSave(BeforeSaveEventArgs<T, TContext> e) => BeforeSave?.Invoke(this, e);
-        protected virtual void OnEntityUpdated(EntityUpdatedEventArgs<T> e) => EntityUpdated?.Invoke(this, e);
-        protected virtual void OnComplete(EntityUpdatedEventArgs<T> e) => Complete?.Invoke(this, e);
-        protected virtual void OnDbEntityValidationException(DbEntityValidationExceptionEventArgs<T> e) => DbEntityValidationException?.Invoke(this, e);
-        protected virtual void OnException(ExceptionEventArgs<T> e) => Exception?.Invoke(this, e);
-        protected virtual void OnSetPropertyException(SetPropertyExceptionEventArgs<T> e) => SetPropertyException?.Invoke(this, e);
 
         private UpdatedValue<object> SetPropertyValue(object entity, string property, string value)
         {
@@ -158,13 +137,13 @@ namespace InlineEdit.Core
             try
             {
                 var original = propertyInfo.GetValue(entity);
-                var newValue = GetValue(value, propertyInfo.PropertyType);
+                var newValue = ValueConverter.Convert(value, propertyInfo.PropertyType);
                 propertyInfo.SetValue(entity, newValue, null);
                 return new UpdatedValue<object>(original, newValue);
             }
             catch (Exception ex)
             {
-                OnSetPropertyException(new SetPropertyExceptionEventArgs<T>
+                SetPropertyException?.Invoke(this, new SetPropertyExceptionEventArgs<T>
                 {
                     Exception = new Exception($"Failed to set value for {entity}[{property}][{value}]", ex),
                     Property = property,
@@ -174,25 +153,9 @@ namespace InlineEdit.Core
             }
         }
 
-        private object GetValue(string value, Type t)
+        public void Dispose()
         {
-            if (t.IsGenericType && t.GetGenericTypeDefinition() == typeof(Nullable<>))
-            {
-                return string.IsNullOrWhiteSpace(value) ? null : GetValue(value, t.GetGenericArguments()[0]);
-            }
-            if (t == typeof(Guid))
-            {
-                return new Guid(value);
-            }
-            if (t.IsEnum)
-            {
-                return Enum.Parse(t, value);
-            }
-            if (t == typeof(DateTime))
-            {
-                return DateTime.Parse(value);
-            }
-            return Convert.ChangeType(value, t);
+            db.Dispose();
         }
     }
 }
